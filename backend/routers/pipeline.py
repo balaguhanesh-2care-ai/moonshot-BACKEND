@@ -1,10 +1,13 @@
 import logging
 from pathlib import Path
+from urllib.parse import urlparse
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 
 from config import AUDIO_FILE_PATH, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from services.ekascribe import transcribe_audio_files
+from services.ekascribe_to_fhir import get_decoded_prescription
 from services.scribe2fhir import emr_json_to_fhir_bundle, is_available as scribe2fhir_available
 from services.supabase_client import insert_fhir_bundle
 
@@ -35,25 +38,48 @@ async def _get_audio_tuples(request: Request) -> list[tuple[str, bytes]]:
             return files
     try:
         body = await request.json()
-        if isinstance(body, dict) and body.get("audio_path"):
-            path = Path(body["audio_path"])
-            if not path.is_file():
+        if isinstance(body, dict):
+            audio_url = body.get("audio_url") or body.get("audio_path")
+            if audio_url and isinstance(audio_url, str) and audio_url.startswith(("http://", "https://")):
+                async with httpx.AsyncClient() as client:
+                    r = await client.get(audio_url, timeout=60.0)
+                    r.raise_for_status()
+                content = r.content
+                name = Path(urlparse(audio_url).path).name or "audio"
+                if not name or name == "/":
+                    name = "audio.mp3"
+                log.info("Fetched audio from URL: %s (%d bytes)", audio_url[:80], len(content))
+                return [(name, content)]
+            if body.get("audio_path"):
+                path = Path(body["audio_path"])
+                if path.is_file():
+                    return [(path.name, path.read_bytes())]
                 raise HTTPException(status_code=400, detail=f"Audio file not found: {body['audio_path']}")
-            return [(path.name, path.read_bytes())]
     except HTTPException:
         raise
     except Exception:
         pass
     if AUDIO_FILE_PATH:
-        path = Path(AUDIO_FILE_PATH)
+        s = AUDIO_FILE_PATH.strip()
+        if s.startswith(("http://", "https://")):
+            async with httpx.AsyncClient() as client:
+                r = await client.get(s, timeout=60.0)
+                r.raise_for_status()
+            content = r.content
+            name = Path(urlparse(s).path).name or "audio"
+            if not name or name == "/":
+                name = "audio.mp3"
+            log.info("Using AUDIO_FILE_PATH (URL): %s (%d bytes)", s[:80], len(content))
+            return [(name, content)]
+        path = Path(s)
         if path.is_file():
             content = path.read_bytes()
-            log.info("Using AUDIO_FILE_PATH: %s (%d bytes)", AUDIO_FILE_PATH, len(content))
+            log.info("Using AUDIO_FILE_PATH (local): %s (%d bytes)", s, len(content))
             return [(path.name, content)]
-        raise HTTPException(status_code=400, detail=f"Audio file not found at AUDIO_FILE_PATH: {AUDIO_FILE_PATH}")
+        raise HTTPException(status_code=400, detail=f"Audio not found: AUDIO_FILE_PATH is not a valid URL or file path")
     raise HTTPException(
         status_code=400,
-        detail="Set AUDIO_FILE_PATH in .env or provide multipart file(s) or JSON body with audio_path",
+        detail="Set AUDIO_FILE_PATH (URL or path) in .env or send multipart file(s) or JSON with audio_url / audio_path",
     )
 
 
@@ -115,11 +141,13 @@ async def audio_to_fhir(request: Request):
                 if patient_id and encounter_id:
                     break
 
+    decoded_prescription = get_decoded_prescription(ekascribe_result)
     try:
-        log.info("Inserting into Supabase (bundle + ekascribe_json)...")
+        log.info("Inserting into Supabase (bundle + ekascribe_json + decoded_prescription)...")
         row = insert_fhir_bundle(
             fhir_bundle,
             ekascribe_json=ekascribe_result,
+            decoded_prescription=decoded_prescription,
             patient_id=patient_id,
             encounter_id=encounter_id,
             txn_id=txn_id,

@@ -1,3 +1,6 @@
+import base64
+import json
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -10,6 +13,8 @@ from scribe2fhir.core import (
     AllergyCategory,
 )
 
+log = logging.getLogger(__name__)
+
 
 def _get_nested(data: dict[str, Any], *keys: str) -> Any:
     for key in keys:
@@ -18,7 +23,50 @@ def _get_nested(data: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def _decode_eka_emr_value(b64_value: str) -> dict[str, Any] | None:
+    if not b64_value or not isinstance(b64_value, str):
+        return None
+    try:
+        raw = base64.b64decode(b64_value, validate=True)
+        decoded = json.loads(raw.decode("utf-8"))
+        if isinstance(decoded, dict):
+            return decoded.get("prescription") or decoded
+        return None
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def _extract_eka_emr_payload(ekascribe_result: dict[str, Any]) -> dict[str, Any] | None:
+    data = ekascribe_result.get("data") or ekascribe_result
+    if not isinstance(data, dict):
+        return None
+    for key in ("output", "template_results"):
+        items = data.get(key)
+        if key == "template_results" and isinstance(items, dict):
+            items = items.get("integration")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            typ = item.get("type") or ""
+            name = (item.get("name") or "") if isinstance(item.get("name"), str) else ""
+            value = item.get("value")
+            if (typ in ("eka_emr", "json") or "Eka EMR" in name) and value:
+                payload = _decode_eka_emr_value(value)
+                if payload:
+                    return payload
+    return None
+
+
+def get_decoded_prescription(ekascribe_result: dict[str, Any]) -> dict[str, Any] | None:
+    return _extract_eka_emr_payload(ekascribe_result)
+
+
 def _extract_payload(ekascribe_result: dict[str, Any]) -> dict[str, Any]:
+    eka = _extract_eka_emr_payload(ekascribe_result)
+    if eka:
+        return eka
     candidates = [
         ekascribe_result.get("result"),
         ekascribe_result.get("output"),
@@ -64,11 +112,48 @@ def _normalize_identifiers(v: Any) -> list[tuple[str, str]] | None:
     return out if out else None
 
 
+def _eka_severity_from_properties(properties: dict[str, Any]) -> Severity | None:
+    if not isinstance(properties, dict):
+        return None
+    for v in properties.values():
+        if isinstance(v, dict) and _safe_str(v.get("name")) == "Severity":
+            sel = v.get("selection") or []
+            if isinstance(sel, list) and sel and isinstance(sel[0], dict):
+                val = _safe_str(sel[0].get("value"))
+                if val and val.lower() in ("mild", "moderate", "severe"):
+                    return Severity(val.lower())
+    return None
+
+
+def _eka_details_from_properties(properties: dict[str, Any]) -> str | None:
+    if not isinstance(properties, dict):
+        return None
+    for v in properties.values():
+        if isinstance(v, dict) and _safe_str(v.get("name")) == "Details":
+            sel = v.get("selection") or []
+            if isinstance(sel, list) and sel and isinstance(sel[0], dict):
+                return _safe_str(sel[0].get("value"))
+    return None
+
+
+def _eka_vital_value(item: dict[str, Any]) -> tuple[Any, str | None]:
+    val = item.get("value")
+    if isinstance(val, dict):
+        qt = val.get("qt")
+        unit = _safe_str(val.get("unit"))
+        return (qt, unit)
+    return (item.get("value"), _safe_str(item.get("unit")))
+
+
 def ekascribe_result_to_fhir_bundle(ekascribe_result: dict[str, Any]) -> dict[str, Any]:
     payload = _extract_payload(ekascribe_result)
+    try:
+        log.info("Eka EMR raw JSON (decoded prescription): %s", json.dumps(payload, indent=2, default=str))
+    except Exception:
+        log.info("Eka EMR raw payload keys: %s", list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__)
     builder = FHIRDocumentBuilder()
 
-    patient = _get_nested(payload, "patient", "patient_info", "patientInfo") or payload
+    patient = _get_nested(payload, "patientDemographics", "patient", "patient_info", "patientInfo") or payload
     if isinstance(patient, dict):
         name = _safe_str(
             patient.get("name") or patient.get("patient_name")
@@ -116,50 +201,164 @@ def ekascribe_result_to_fhir_bundle(ekascribe_result: dict[str, Any]) -> dict[st
         if isinstance(item, dict):
             code = _safe_str(item.get("code") or item.get("name") or item.get("text"))
             if code:
+                props = item.get("properties") or {}
+                sev = _eka_severity_from_properties(props)
+                details = _eka_details_from_properties(props) if not sev else None
                 builder.add_symptom(
                     code=code,
-                    severity=Severity(item.get("severity", "moderate").lower()) if isinstance(item.get("severity"), str) and item.get("severity").lower() in ("mild", "moderate", "severe") else None,
-                    notes=_safe_str(item.get("notes") or item.get("description")),
+                    severity=sev,
+                    notes=details or _safe_str(item.get("notes") or item.get("description")),
                     finding_status=FindingStatus.PRESENT if item.get("present", True) else FindingStatus.ABSENT,
                 )
         elif isinstance(item, str) and item.strip():
             builder.add_symptom(code=item.strip())
 
-    for item in _safe_list(_get_nested(payload, "conditions", "diagnosis", "diagnoses", "medical_conditions")):
+    history = _get_nested(payload, "medicalHistory", "medical_history") or {}
+    patient_history = (history.get("patientHistory") or history) if isinstance(history, dict) else {}
+    if isinstance(patient_history, dict):
+        for item in _safe_list(patient_history.get("patientMedicalConditions") or patient_history.get("patient_medical_conditions")):
+            if isinstance(item, dict):
+                code = _safe_str(item.get("name") or item.get("code"))
+                if code:
+                    builder.add_medical_condition_history(
+                        code=code,
+                        notes=_safe_str(item.get("notes")),
+                        clinical_status=ConditionClinicalStatus.ACTIVE if _safe_str(item.get("status")) == "Active" else ConditionClinicalStatus.INACTIVE,
+                    )
+            elif isinstance(item, str) and item.strip():
+                builder.add_medical_condition_history(code=item.strip())
+
+        for item in _safe_list(patient_history.get("currentMedications") or patient_history.get("current_medications")):
+            if isinstance(item, dict):
+                med = _safe_str(item.get("name") or item.get("code"))
+                if med:
+                    builder.add_medication_history(
+                        medication=med,
+                        notes=_safe_str(item.get("notes")),
+                        status=_safe_str(item.get("status")) or "active",
+                    )
+            elif isinstance(item, str) and item.strip():
+                builder.add_medication_history(medication=item.strip())
+
+        for item in _safe_list(patient_history.get("familyHistory") or patient_history.get("family_history")):
+            if isinstance(item, dict):
+                code = _safe_str(item.get("name") or item.get("code"))
+                who = _safe_str(item.get("who"))
+                if code:
+                    builder.add_family_history(condition=code, relation=who)
+
+        for item in _safe_list(patient_history.get("lifestyleHabits") or patient_history.get("lifestyle_habits")):
+            if isinstance(item, dict):
+                code = _safe_str(item.get("name") or item.get("code"))
+                if code:
+                    builder.add_lifestyle_history(
+                        code=code,
+                        status_value=_safe_str(item.get("status")),
+                        notes=_safe_str(item.get("notes")),
+                    )
+
+        for item in _safe_list(patient_history.get("foodOtherAllergy") or patient_history.get("food_other_allergy")):
+            if isinstance(item, dict):
+                code = _safe_str(item.get("name") or item.get("code"))
+                if code:
+                    builder.add_allergy_history(
+                        code=code,
+                        category=AllergyCategory.FOOD,
+                        clinical_status=_safe_str(item.get("status")) or "inactive",
+                    )
+            elif isinstance(item, str) and item.strip():
+                builder.add_allergy_history(code=item.strip(), category=AllergyCategory.FOOD)
+
+        for item in _safe_list(patient_history.get("drugAllergy") or patient_history.get("drug_allergy")):
+            if isinstance(item, dict):
+                code = _safe_str(item.get("name") or item.get("code"))
+                if code:
+                    builder.add_allergy_history(
+                        code=code,
+                        category=AllergyCategory.MEDICATION,
+                        clinical_status=_safe_str(item.get("status")) or "inactive",
+                    )
+            elif isinstance(item, str) and item.strip():
+                builder.add_allergy_history(code=item.strip(), category=AllergyCategory.MEDICATION)
+
+    for item in _safe_list(_get_nested(payload, "examinations", "examination")):
+        if isinstance(item, dict):
+            code = _safe_str(item.get("name") or item.get("code"))
+            notes = _safe_str(item.get("notes"))
+            if code:
+                builder.add_examination_finding(code=code, value=notes, notes=notes)
+
+    for item in _safe_list(_get_nested(payload, "vitals", "vital_signs", "observations")):
+        if isinstance(item, dict):
+            code = _safe_str(item.get("dis_name") or item.get("name") or item.get("code"))
+            val, unit = _eka_vital_value(item)
+            if code and val is not None:
+                builder.add_vital_finding(code=code, value=val, unit=unit)
+
+    for item in _safe_list(_get_nested(payload, "diagnosis", "conditions", "diagnoses", "medical_conditions")):
         if isinstance(item, dict):
             code = _safe_str(item.get("code") or item.get("condition_name") or item.get("name") or item.get("icd_code"))
             if code:
                 builder.add_medical_condition_encountered(
                     code=code,
-                    severity=Severity(item.get("severity", "mild").lower()) if isinstance(item.get("severity"), str) and item.get("severity").lower() in ("mild", "moderate", "severe") else None,
-                    notes=_safe_str(item.get("notes")),
+                    severity=_eka_severity_from_properties(item.get("properties") or {}),
+                    notes=_eka_details_from_properties(item.get("properties") or {}),
                 )
         elif isinstance(item, str) and item.strip():
             builder.add_medical_condition_encountered(code=item.strip())
-
-    for item in _safe_list(_get_nested(payload, "vitals", "vital_signs", "observations")):
-        if isinstance(item, dict):
-            code = _safe_str(item.get("code") or item.get("measurement_type") or item.get("name"))
-            value = item.get("value") or item.get("systolic_value") or (f"{item.get('systolic_value')}/{item.get('diastolic_value')}" if item.get("diastolic_value") is not None else None)
-            if code:
-                builder.add_vital_finding(
-                    code=code,
-                    value=value,
-                    unit=_safe_str(item.get("unit")),
-                    interpretation=Interpretation(item.get("interpretation", "normal").lower()) if isinstance(item.get("interpretation"), str) and item.get("interpretation").lower() in ("normal", "high", "low", "abnormal") else None,
-                )
 
     for item in _safe_list(_get_nested(payload, "medications", "medication_prescriptions", "prescriptions")):
         if isinstance(item, dict):
             med = _safe_str(item.get("medication") or item.get("medication_name") or item.get("name"))
             if med:
+                freq = item.get("frequency")
+                dur = item.get("duration")
+                dosage_str = None
+                if isinstance(freq, dict):
+                    dosage_str = _safe_str(freq.get("custom"))
+                if isinstance(dur, dict):
+                    d = _safe_str(dur.get("custom"))
+                    if d:
+                        dosage_str = f"{dosage_str or ''} {d}".strip() or dosage_str
                 builder.add_medication_prescribed(
                     medication=med,
                     dosage=None,
-                    notes=_safe_str(item.get("dosage") or item.get("notes")),
+                    notes=_safe_str(item.get("instruction")) or dosage_str,
                 )
         elif isinstance(item, str) and item.strip():
             builder.add_medication_prescribed(medication=item.strip())
+
+    for item in _safe_list(_get_nested(payload, "advices", "advice")):
+        if isinstance(item, dict):
+            text = _safe_str(item.get("text") or item.get("parsedText"))
+            if text:
+                builder.add_advice(note=text)
+        elif isinstance(item, str) and item.strip():
+            builder.add_advice(note=item.strip())
+
+    followup = _get_nested(payload, "followup", "follow_up")
+    if isinstance(followup, dict):
+        date_val = followup.get("date")
+        notes_val = _safe_str(followup.get("notes"))
+        if date_val or notes_val:
+            try:
+                dt = datetime.fromisoformat(str(date_val).replace("Z", "+00:00")) if date_val else None
+            except (ValueError, TypeError):
+                dt = None
+            builder.add_followup(date=dt, notes=notes_val)
+
+    prescription_notes = _get_nested(payload, "prescriptionNotes", "prescription_notes")
+    if isinstance(prescription_notes, dict):
+        text = _safe_str(prescription_notes.get("text") or prescription_notes.get("parsedText"))
+        if text:
+            builder.add_notes(note=text, category="clinical-note")
+
+    for item in _safe_list(_get_nested(payload, "labTests", "lab_tests", "lab_tests_prescribed")):
+        if isinstance(item, dict):
+            code = _safe_str(item.get("name") or item.get("common_name") or item.get("code"))
+            remark = _safe_str(item.get("remark"))
+            if code:
+                builder.add_test_prescribed(code=code, notes=remark)
 
     for item in _safe_list(_get_nested(payload, "notes", "clinical_notes", "transcription_text")):
         if isinstance(item, dict):

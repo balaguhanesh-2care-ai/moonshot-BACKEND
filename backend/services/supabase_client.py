@@ -17,6 +17,7 @@ def insert_fhir_bundle(
     bundle_json: dict[str, Any],
     *,
     ekascribe_json: dict[str, Any] | None = None,
+    decoded_prescription: dict[str, Any] | None = None,
     patient_id: str | None = None,
     encounter_id: str | None = None,
     txn_id: str | None = None,
@@ -25,6 +26,7 @@ def insert_fhir_bundle(
     row = {
         "bundle_json": bundle_json,
         "ekascribe_json": ekascribe_json,
+        "decoded_prescription": decoded_prescription,
         "patient_id": patient_id,
         "encounter_id": encounter_id,
         "txn_id": txn_id,
