@@ -1,6 +1,8 @@
-# scribe2fhir  # uncomment when available (e.g. private PyPI)
+scribe2fhir
 fastapi
 uvicorn[standard]
 httpx
+requests
 python-multipart
 python-dotenv
+supabase

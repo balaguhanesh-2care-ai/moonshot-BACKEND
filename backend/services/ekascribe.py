@@ -1,10 +1,13 @@
 import asyncio
+import logging
 import uuid
 from typing import Any
 
 import httpx
 
 from config import get_eka_headers
+
+log = logging.getLogger(__name__)
 
 EKA_BASE = "https://api.eka.care"
 FILE_UPLOAD_URL = f"{EKA_BASE}/v1/file-upload"
@@ -28,6 +31,24 @@ async def get_presigned_url(txn_id: str) -> dict[str, Any]:
         return r.json()
 
 
+def _upload_to_s3_sync(
+    url: str,
+    form_data: list[tuple[str, str | bytes]],
+    filename: str,
+    file_content: bytes,
+) -> None:
+    import requests
+    if not isinstance(file_content, bytes):
+        file_content = bytes(file_content)
+    r = requests.post(
+        url,
+        data=form_data,
+        files={"file": (filename, file_content)},
+        timeout=60,
+    )
+    r.raise_for_status()
+
+
 async def upload_to_s3(
     upload_data: dict[str, Any],
     folder_path: str,
@@ -37,11 +58,24 @@ async def upload_to_s3(
     url = upload_data["url"]
     fields = dict(upload_data["fields"])
     fields["key"] = folder_path + filename
-    form_data = list(fields.items())
-    files = {"file": (filename, file_content)}
-    async with httpx.AsyncClient() as client:
-        r = await client.post(url, data=form_data, files=files, timeout=60.0)
-        r.raise_for_status()
+    form_data: list[tuple[str, str | bytes]] = []
+    for k, v in fields.items():
+        if isinstance(v, bytes):
+            form_data.append((str(k), v))
+        elif isinstance(v, str):
+            form_data.append((str(k), v))
+        elif isinstance(v, (tuple, list)):
+            form_data.append((str(k), str(v)))
+        else:
+            form_data.append((str(k), str(v)))
+    file_content = file_content if isinstance(file_content, bytes) else bytes(file_content)
+    await asyncio.to_thread(
+        _upload_to_s3_sync,
+        url,
+        form_data,
+        str(filename),
+        file_content,
+    )
 
 
 async def init_transaction(
@@ -89,12 +123,27 @@ async def get_status(txn_id: str) -> tuple[int, dict[str, Any]]:
         return r.status_code, r.json() if r.content else {}
 
 
+def _raise_eka_error(response: httpx.Response, context: str = "") -> None:
+    raw = (response.text or "")[:1000]
+    if raw:
+        log.error("EkaCare response body (raw): %s", raw)
+    try:
+        body = response.json()
+        msg = body.get("message") or body.get("error") or body.get("detail") or str(body)
+    except Exception:
+        msg = response.text or response.reason_phrase or str(response.status_code)
+    err = f"EkaCare {response.status_code} ({context}): {msg}"
+    log.error("%s", err)
+    response.raise_for_status()
+
+
 async def transcribe_audio_files(
     files: list[tuple[str, bytes]],
 ) -> dict[str, Any]:
     if not files:
         raise ValueError("At least one file required")
     txn_id = f"txn_{uuid.uuid4().hex[:12]}"
+    log.info("EkaScribe txn_id=%s files=%s", txn_id, [n for n, _ in files])
     headers = get_eka_headers()
     async with httpx.AsyncClient() as client:
         r = await client.post(
@@ -103,7 +152,8 @@ async def transcribe_audio_files(
             headers=headers,
             timeout=30.0,
         )
-        r.raise_for_status()
+        if not r.is_success:
+            _raise_eka_error(r, "file-upload presigned URL")
         presigned = r.json()
     upload_data = presigned["uploadData"]
     folder_path = presigned["folderPath"]
@@ -111,15 +161,23 @@ async def transcribe_audio_files(
     for filename, content in files:
         await upload_to_s3(upload_data, folder_path, content, filename)
         filenames.append(filename)
+    log.info("EkaScribe upload done: %s", filenames)
     batch_s3_url = upload_data["url"].rstrip("/") + "/" + folder_path
     await init_transaction(txn_id, batch_s3_url, filenames)
-    for _ in range(MAX_POLL_ATTEMPTS):
+    log.info("EkaScribe init done, polling status...")
+    for attempt in range(MAX_POLL_ATTEMPTS):
         status_code, data = await get_status(txn_id)
         if status_code == 200:
+            log.info("EkaScribe completed (200) after %d poll(s). Keys: %s", attempt + 1, list(data.keys()) if isinstance(data, dict) else "n/a")
             return data
         if status_code == 206:
+            log.info("EkaScribe completed (206) after %d poll(s). Keys: %s", attempt + 1, list(data.keys()) if isinstance(data, dict) else "n/a")
             return data
         if status_code != 202:
+            log.error("EkaScribe status %s: %s", status_code, data)
             raise RuntimeError(f"EkaScribe status {status_code}: {data}")
+        if attempt % 10 == 0 and attempt:
+            log.info("EkaScribe still processing (202), poll #%d", attempt + 1)
         await asyncio.sleep(POLL_INTERVAL_SEC)
+    log.error("EkaScribe timed out after %d polls", MAX_POLL_ATTEMPTS)
     raise TimeoutError("EkaScribe transcription did not complete in time")
