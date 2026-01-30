@@ -60,6 +60,32 @@ Specific origins:
 CORS_ORIGINS=https://your-frontend.vercel.app,https://app.yourdomain.com
 ```
 
+## scribe2fhir (required for pipeline)
+
+The pipeline needs the **scribe2fhir** package. It is a local path dependency at `scribe2fhir/python`. You must have that folder in the repo at build time or the pipeline returns **503 "scribe2fhir SDK not available"** in production.
+
+### Option A: Git submodule (if scribe2fhir is a separate repo)
+
+From repo root:
+
+```bash
+git submodule add <URL-of-scribe2fhir-repo> scribe2fhir
+```
+
+The repo layout must expose the Python package at `scribe2fhir/python` (i.e. either the repo root is the package and you add it as `scribe2fhir` with a `python` subdir, or the repo has a `python` folder at top level—adjust the path in `pyproject.toml` `[tool.uv.sources]` if different).
+
+Then in **Vercel** → Project → Settings → Git → enable **Include Git Submodules**. Redeploy so the build clones the submodule and `uv` can install from `scribe2fhir/python`.
+
+### Option B: Vendor the package
+
+Copy the scribe2fhir Python package into this repo so the path `scribe2fhir/python` exists (e.g. clone the scribe2fhir repo and copy its package folder into `scribe2fhir/python`). Commit and push. No submodule or Vercel setting needed.
+
+### If you cannot add scribe2fhir
+
+Remove `scribe2fhir` and `[tool.uv.sources]` from `pyproject.toml`, run `uv lock`, and redeploy. The app will start but pipeline endpoints will return 503 until scribe2fhir is available.
+
+---
+
 ## Python dependencies (pyproject.toml)
 
 - fastapi
