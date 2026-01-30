@@ -15,18 +15,21 @@ router = APIRouter()
 log = logging.getLogger(__name__)
 
 
-def _ensure_supabase() -> None:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="Supabase not configured (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY or NEXT_PUBLIC_* equivalents)",
-        )
+def _supabase_configured() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
 
 FALLBACK_BUNDLE: dict = {
     "resourceType": "Bundle",
     "type": "document",
     "entry": [],
+}
+
+FALLBACK_SCRIBE: dict = {
+    "status": "fallback",
+    "txn_id": "fallback",
+    "data": {},
+    "error_fallback": True,
 }
 
 
@@ -40,13 +43,31 @@ def _pipeline_response(
 ) -> dict:
     out: dict = {
         "ok": ok,
-        "bundle": bundle or FALLBACK_BUNDLE,
+        "bundle": bundle if bundle is not None else FALLBACK_BUNDLE,
         "db": db,
         "errors": errors,
     }
-    if scribe is not None:
-        out["scribe"] = scribe
+    out["scribe"] = scribe if scribe is not None else FALLBACK_SCRIBE
     return out
+
+
+def _try_store_fallback(bundle: dict, scribe: dict, errors: list[dict]) -> dict | None:
+    if not _supabase_configured():
+        return None
+    try:
+        row = insert_fhir_bundle(
+            bundle,
+            ekascribe_json=scribe,
+            decoded_prescription=None,
+            patient_id=None,
+            encounter_id=None,
+            txn_id=scribe.get("txn_id") or "fallback",
+        )
+        return {"id": row.get("id"), "created_at": row.get("created_at")}
+    except Exception as e:
+        log.warning("Fallback DB insert failed: %s", e)
+        errors.append({"step": "db", "message": str(e)})
+        return None
 
 
 async def _get_audio_tuples(request: Request) -> list[tuple[str, bytes]]:
@@ -127,11 +148,28 @@ async def audio_to_fhir(
     Required: X-EkaScribe-Api-Token or (X-EkaScribe-Client-Id + X-EkaScribe-Client-Secret). Optional: X-EkaScribe-Base-Url.
     """
     log.info("Pipeline /audio-to-fhir started")
-    if not scribe2fhir_available():
-        raise HTTPException(status_code=503, detail="scribe2fhir SDK not available")
-    _ensure_supabase()
+    errors: list[dict] = []
+    ekascribe_result: dict | None = None
+    fhir_bundle: dict | None = None
+    row: dict | None = None
 
-    file_tuples = await _get_audio_tuples(request)
+    if not scribe2fhir_available():
+        errors.append({"step": "config", "message": "scribe2fhir SDK not available"})
+        db_fallback = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fallback, errors=errors, scribe=FALLBACK_SCRIBE)
+
+    try:
+        file_tuples = await _get_audio_tuples(request)
+    except HTTPException as e:
+        errors.append({"step": "input", "message": e.detail or str(e)})
+        db_fallback = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fallback, errors=errors, scribe=FALLBACK_SCRIBE)
+    except Exception as e:
+        log.exception("Get audio failed")
+        errors.append({"step": "input", "message": str(e)})
+        db_fallback = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fallback, errors=errors, scribe=FALLBACK_SCRIBE)
+
     total_bytes = sum(len(c) for _, c in file_tuples)
     log.info("Audio input: %d file(s), %d bytes total: %s", len(file_tuples), total_bytes, [n for n, _ in file_tuples])
 
@@ -141,26 +179,27 @@ async def audio_to_fhir(
         x_eka_api_token, x_eka_client_id, x_eka_client_secret, x_eka_base_url,
     )
     if not eka_auth:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing Scribe credentials: send X-EkaScribe-Api-Token or X-EkaScribe-Client-Id + X-EkaScribe-Client-Secret",
-        )
-
-    errors: list[dict] = []
-    ekascribe_result: dict | None = None
-    fhir_bundle: dict | None = None
-    row: dict | None = None
+        errors.append({"step": "auth", "message": "Missing Scribe credentials"})
+        db_fallback = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fallback, errors=errors, scribe=FALLBACK_SCRIBE)
 
     try:
         log.info("Calling EkaScribe (upload + init + poll)...")
         ekascribe_result = await transcribe_audio_files(file_tuples, eka_auth=eka_auth)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        errors.append({"step": "ekascribe", "message": str(e)})
+        db_fallback = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fallback, errors=errors, scribe=FALLBACK_SCRIBE)
     except TimeoutError as e:
-        raise HTTPException(status_code=504, detail=str(e))
+        errors.append({"step": "ekascribe", "message": str(e)})
+        db_fallback = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fallback, errors=errors, scribe=FALLBACK_SCRIBE)
     except EkaScribeError as e:
         log.warning("EkaScribe failed: %s", e.message)
         errors.append({"step": "ekascribe", "message": e.message})
+        scribe_fb = ekascribe_result if isinstance(ekascribe_result, dict) else FALLBACK_SCRIBE
+        db_fallback = _try_store_fallback(FALLBACK_BUNDLE, scribe_fb, errors) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fallback, errors=errors, scribe=scribe_fb)
     except Exception as e:
         log.exception("EkaScribe failed")
         detail = str(e)
@@ -169,17 +208,18 @@ async def audio_to_fhir(
                 body = e.response.json()
                 detail = body.get("message") or body.get("error") or body.get("detail") or detail
             except Exception:
-                if e.response.text:
+                if getattr(e.response, "text", None):
                     detail = e.response.text[:500]
         errors.append({"step": "ekascribe", "message": detail})
-
-    if errors:
-        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors, scribe=ekascribe_result)
+        scribe_fb = ekascribe_result if isinstance(ekascribe_result, dict) else FALLBACK_SCRIBE
+        db_fallback = _try_store_fallback(FALLBACK_BUNDLE, scribe_fb, errors) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fallback, errors=errors, scribe=scribe_fb)
 
     if not isinstance(ekascribe_result, dict):
         log.error("EkaScribe returned non-dict: %s", type(ekascribe_result).__name__)
         errors.append({"step": "ekascribe", "message": "Invalid response shape"})
-        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors, scribe=ekascribe_result)
+        db_fallback = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fallback, errors=errors, scribe=FALLBACK_SCRIBE)
     log.info("EkaScribe done. Response top-level keys: %s", list(ekascribe_result.keys()))
 
     try:
@@ -188,12 +228,14 @@ async def audio_to_fhir(
     except Exception as e:
         log.exception("scribe2fhir mapping failed")
         errors.append({"step": "fhir", "message": str(e)})
-        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors, scribe=ekascribe_result)
+        db_fallback = _try_store_fallback(FALLBACK_BUNDLE, ekascribe_result, errors) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fallback, errors=errors, scribe=ekascribe_result)
 
     if not isinstance(fhir_bundle, dict) or fhir_bundle.get("resourceType") != "Bundle":
         log.error("FHIR bundle invalid")
         errors.append({"step": "fhir", "message": "Invalid FHIR Bundle"})
-        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors, scribe=ekascribe_result)
+        db_fallback = _try_store_fallback(FALLBACK_BUNDLE, ekascribe_result, errors) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fallback, errors=errors, scribe=ekascribe_result)
     log.info("FHIR bundle built: %d entries", len(fhir_bundle.get("entry") or []))
 
     patient_id = None
@@ -313,11 +355,28 @@ async def audio_to_emr(
     Required: X-Pt-Id; X-EkaScribe-Api-Token (or Scribe client id+secret); X-EkaEmr-Api-Token or X-Eka-Client-Id + X-Eka-Client-Secret.
     """
     log.info("Pipeline /audio-to-emr started (X-Pt-Id=%s)", x_pt_id[:20] + "..." if len(x_pt_id) > 20 else x_pt_id)
-    if not scribe2fhir_available():
-        raise HTTPException(status_code=503, detail="scribe2fhir SDK not available")
-    _ensure_supabase()
+    errors_emr: list[dict] = []
+    ekascribe_result_emr: dict | None = None
+    fhir_bundle_emr: dict | None = None
+    row_emr: dict | None = None
 
-    file_tuples = await _get_audio_tuples(request)
+    if not scribe2fhir_available():
+        errors_emr.append({"step": "config", "message": "scribe2fhir SDK not available"})
+        db_fb = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors_emr) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fb, errors=errors_emr, scribe=FALLBACK_SCRIBE)
+
+    try:
+        file_tuples = await _get_audio_tuples(request)
+    except HTTPException as e:
+        errors_emr.append({"step": "input", "message": e.detail or str(e)})
+        db_fb = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors_emr) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fb, errors=errors_emr, scribe=FALLBACK_SCRIBE)
+    except Exception as e:
+        log.exception("Get audio failed")
+        errors_emr.append({"step": "input", "message": str(e)})
+        db_fb = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors_emr) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fb, errors=errors_emr, scribe=FALLBACK_SCRIBE)
+
     total_bytes = sum(len(c) for _, c in file_tuples)
     log.info("Audio input: %d file(s), %d bytes: %s", len(file_tuples), total_bytes, [n for n, _ in file_tuples])
 
@@ -327,34 +386,35 @@ async def audio_to_emr(
         x_eka_api_token, x_eka_client_id, x_eka_client_secret, x_eka_base_url,
     )
     if not eka_scribe_auth:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing Scribe credentials: send X-EkaScribe-Api-Token or X-EkaScribe-Client-Id + X-EkaScribe-Client-Secret",
-        )
+        errors_emr.append({"step": "auth", "message": "Missing Scribe credentials"})
+        db_fb = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors_emr) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fb, errors=errors_emr, scribe=FALLBACK_SCRIBE)
     eka_emr_auth = _eka_emr_auth_from_headers(
         x_eka_emr_api_token, x_eka_emr_client_id, x_eka_emr_client_secret, x_eka_emr_base_url,
         x_eka_api_token, x_eka_client_id, x_eka_client_secret, x_eka_base_url,
     )
     if not eka_emr_auth:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing EMR credentials: send X-EkaEmr-Api-Token or X-Eka-Client-Id + X-Eka-Client-Secret",
-        )
-    errors_emr: list[dict] = []
-    ekascribe_result_emr: dict | None = None
-    fhir_bundle_emr: dict | None = None
-    row_emr: dict | None = None
+        errors_emr.append({"step": "auth", "message": "Missing EMR credentials"})
+        db_fb = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors_emr) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fb, errors=errors_emr, scribe=FALLBACK_SCRIBE)
 
     try:
         log.info("Calling EkaScribe (upload + init + poll)...")
         ekascribe_result_emr = await transcribe_audio_files(file_tuples, eka_auth=eka_scribe_auth)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        errors_emr.append({"step": "ekascribe", "message": str(e)})
+        db_fb = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors_emr) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fb, errors=errors_emr, scribe=FALLBACK_SCRIBE)
     except TimeoutError as e:
-        raise HTTPException(status_code=504, detail=str(e))
+        errors_emr.append({"step": "ekascribe", "message": str(e)})
+        db_fb = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors_emr) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fb, errors=errors_emr, scribe=FALLBACK_SCRIBE)
     except EkaScribeError as e:
         log.warning("EkaScribe failed: %s", e.message)
         errors_emr.append({"step": "ekascribe", "message": e.message})
+        scribe_fb = ekascribe_result_emr if isinstance(ekascribe_result_emr, dict) else FALLBACK_SCRIBE
+        db_fb = _try_store_fallback(FALLBACK_BUNDLE, scribe_fb, errors_emr) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fb, errors=errors_emr, scribe=scribe_fb)
     except Exception as e:
         log.exception("EkaScribe failed")
         detail = str(e)
@@ -363,29 +423,32 @@ async def audio_to_emr(
                 body = e.response.json()
                 detail = body.get("message") or body.get("error") or body.get("detail") or detail
             except Exception:
-                if e.response.text:
+                if getattr(e.response, "text", None):
                     detail = e.response.text[:500]
         errors_emr.append({"step": "ekascribe", "message": detail})
-
-    if errors_emr:
-        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors_emr, scribe=ekascribe_result_emr)
+        scribe_fb = ekascribe_result_emr if isinstance(ekascribe_result_emr, dict) else FALLBACK_SCRIBE
+        db_fb = _try_store_fallback(FALLBACK_BUNDLE, scribe_fb, errors_emr) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fb, errors=errors_emr, scribe=scribe_fb)
 
     if not isinstance(ekascribe_result_emr, dict):
         log.error("EkaScribe returned non-dict: %s", type(ekascribe_result_emr).__name__)
         errors_emr.append({"step": "ekascribe", "message": "Invalid response shape"})
-        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors_emr, scribe=ekascribe_result_emr)
+        db_fb = _try_store_fallback(FALLBACK_BUNDLE, FALLBACK_SCRIBE, errors_emr) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fb, errors=errors_emr, scribe=FALLBACK_SCRIBE)
 
     try:
         fhir_bundle_emr = emr_json_to_fhir_bundle(ekascribe_result_emr)
     except Exception as e:
         log.exception("scribe2fhir mapping failed")
         errors_emr.append({"step": "fhir", "message": str(e)})
-        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors_emr, scribe=ekascribe_result_emr)
+        db_fb = _try_store_fallback(FALLBACK_BUNDLE, ekascribe_result_emr, errors_emr) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fb, errors=errors_emr, scribe=ekascribe_result_emr)
 
     if not isinstance(fhir_bundle_emr, dict) or fhir_bundle_emr.get("resourceType") != "Bundle":
         log.error("FHIR bundle invalid")
         errors_emr.append({"step": "fhir", "message": "Invalid FHIR Bundle"})
-        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors_emr, scribe=ekascribe_result_emr)
+        db_fb = _try_store_fallback(FALLBACK_BUNDLE, ekascribe_result_emr, errors_emr) if _supabase_configured() else None
+        return _pipeline_response(ok=False, bundle=FALLBACK_BUNDLE, db=db_fb, errors=errors_emr, scribe=ekascribe_result_emr)
 
     patient_id = None
     encounter_id = None
