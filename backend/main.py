@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import validate_eka_config
-from routers import ekascribe, pipeline, scribe2fhir
+from routers import eka_abdm, ekascribe, pipeline, scribe2fhir
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +40,7 @@ app.add_middleware(
 app.include_router(ekascribe.router, prefix="/api/ekascribe", tags=["ekascribe"])
 app.include_router(scribe2fhir.router, prefix="/api/scribe2fhir", tags=["scribe2fhir"])
 app.include_router(pipeline.router, prefix="/api/pipeline", tags=["pipeline"])
+app.include_router(eka_abdm.router, prefix="/api/eka-abdm", tags=["eka-abdm"])
 
 
 @app.get("/health")

@@ -17,7 +17,8 @@ EKA_API_TOKEN = os.getenv("EKA_API_TOKEN", "").strip() or None
 EKA_CLIENT_ID = os.getenv("EKA_CLIENT_ID", "").strip() or None
 EKA_CLIENT_SECRET = os.getenv("EKA_CLIENT_SECRET", "").strip() or None
 
-CONNECT_LOGIN_URL = "https://api.eka.care/connect-auth/v1/account/login"
+EKA_BASE_URL = os.getenv("EKA_BASE_URL", "").strip() or "https://api.eka.care"
+CONNECT_LOGIN_URL = f"{EKA_BASE_URL.rstrip('/')}/connect-auth/v1/account/login"
 _eka_token_cache: dict = {}
 
 SCRIBE_API_KEY = os.getenv("SCRIBE_API_KEY")

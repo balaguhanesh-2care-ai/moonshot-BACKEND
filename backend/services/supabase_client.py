@@ -37,3 +37,11 @@ def insert_fhir_bundle(
     inserted = result.data[0]
     log.info("Supabase insert fhir_bundles id=%s", inserted.get("id"))
     return inserted
+
+
+def get_fhir_bundle_by_id(row_id: str) -> dict[str, Any] | None:
+    client = get_supabase_client()
+    result = client.table("fhir_bundles").select("bundle_json").eq("id", row_id).limit(1).execute()
+    if not result.data or len(result.data) == 0:
+        return None
+    return result.data[0].get("bundle_json")
