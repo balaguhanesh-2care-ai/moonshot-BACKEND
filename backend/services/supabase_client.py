@@ -45,3 +45,50 @@ def get_fhir_bundle_by_id(row_id: str) -> dict[str, Any] | None:
     if not result.data or len(result.data) == 0:
         return None
     return result.data[0].get("bundle_json")
+
+
+def get_first_fhir_bundle() -> dict[str, Any] | None:
+    client = get_supabase_client()
+    result = (
+        client.table("fhir_bundles")
+        .select("bundle_json")
+        .order("created_at", desc=False)
+        .limit(1)
+        .execute()
+    )
+    if not result.data or len(result.data) == 0:
+        return None
+    return result.data[0].get("bundle_json")
+
+
+def upsert_emr_mapping(
+    emr_id: str,
+    push_fhir: list[dict[str, Any]],
+    get_fhir: list[dict[str, Any]],
+    *,
+    api_doc_url: str | None = None,
+) -> dict[str, Any]:
+    client = get_supabase_client()
+    row = {
+        "emr_id": emr_id,
+        "push_fhir": push_fhir,
+        "get_fhir": get_fhir,
+        "api_doc_url": api_doc_url,
+    }
+    result = client.table("emr_mappings").upsert(
+        row,
+        on_conflict="emr_id",
+        returning="representation",
+    ).execute()
+    if not result.data or len(result.data) == 0:
+        raise RuntimeError("Supabase upsert emr_mappings returned no data")
+    log.info("Supabase upsert emr_mappings emr_id=%s", emr_id)
+    return result.data[0]
+
+
+def get_emr_mapping(emr_id: str) -> dict[str, Any] | None:
+    client = get_supabase_client()
+    result = client.table("emr_mappings").select("push_fhir, get_fhir").eq("emr_id", emr_id).limit(1).execute()
+    if not result.data or len(result.data) == 0:
+        return None
+    return result.data[0]

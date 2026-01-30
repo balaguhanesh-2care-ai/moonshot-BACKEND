@@ -7,14 +7,14 @@ from typing import Any
 import httpx
 import requests
 
-from config import EKA_BASE_URL, get_eka_headers
+from config import EKAEMR_BASE_URL, get_eka_emr_headers, get_eka_emr_headers_from_params
 
 log = logging.getLogger(__name__)
 
-EKA_BASE = "https://api.eka.care"
-ABDM_DATA_ON_PUSH_URL = f"{EKA_BASE}/abdm/v1/hiu/care-context/data/on-push"
-RECORDS_OBTAIN_AUTH_URL = f"{EKA_BASE}/mr/api/v1/docs"
-PATIENT_CREATE_URL = f"{EKA_BASE}/profiles/v1/patient/"
+EKAEMR_BASE = "https://api.eka.care"
+ABDM_DATA_ON_PUSH_URL = f"{EKAEMR_BASE}/abdm/v1/hiu/care-context/data/on-push"
+RECORDS_OBTAIN_AUTH_URL = f"{EKAEMR_BASE}/mr/api/v1/docs"
+PATIENT_CREATE_URL = f"{EKAEMR_BASE}/profiles/v1/patient/"
 
 
 def _minimal_pdf_bytes(title: str = "Scribe to EkaCare") -> bytes:
@@ -30,6 +30,17 @@ def _minimal_pdf_bytes(title: str = "Scribe to EkaCare") -> bytes:
     return buf.getvalue()
 
 
+def _eka_headers_and_base(eka_auth: dict[str, Any] | None) -> tuple[dict[str, str], str]:
+    if eka_auth and (eka_auth.get("api_token") or (eka_auth.get("client_id") and eka_auth.get("client_secret"))):
+        return get_eka_emr_headers_from_params(
+            api_token=eka_auth.get("api_token"),
+            client_id=eka_auth.get("client_id"),
+            client_secret=eka_auth.get("client_secret"),
+            base_url=eka_auth.get("base_url"),
+        )
+    return get_eka_emr_headers(), (EKAEMR_BASE_URL or EKAEMR_BASE).rstrip("/")
+
+
 def push_fhir_parsing_status(
     consent_id: str,
     transaction_id: str,
@@ -38,7 +49,8 @@ def push_fhir_parsing_status(
     x_pt_id: str | None = None,
     x_partner_pt_id: str | None = None,
     x_hip_id: str | None = None,
-    base_url: str = EKA_BASE,
+    base_url: str = EKAEMR_BASE,
+    eka_auth: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Report care context FHIR parsing status to EkaCare (HIU data-on-push).
@@ -46,13 +58,14 @@ def push_fhir_parsing_status(
     Call this after you receive and parse care context data from EkaCare (HIP).
     Each item in status_response should have: care_context_id, success (bool), description (str).
     """
-    url = f"{base_url.rstrip('/')}/abdm/v1/hiu/care-context/data/on-push"
+    headers, base = _eka_headers_and_base(eka_auth)
+    url = f"{base.rstrip('/')}/abdm/v1/hiu/care-context/data/on-push"
     body = {
         "consent_id": consent_id,
         "transaction_id": transaction_id,
         "status_response": status_response,
     }
-    headers = {**get_eka_headers(), "Content-Type": "application/json"}
+    headers = {**headers, "Content-Type": "application/json"}
     if x_pt_id:
         headers["X-Pt-Id"] = x_pt_id
     if x_partner_pt_id:
@@ -95,6 +108,7 @@ def push_fhir_to_eka_records(
     tags: list[str] | None = None,
     base_url: str | None = None,
     include_metadata: bool = True,
+    eka_auth: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Full two-step EkaCare Records upload: Step 1 obtain presigned URL (with FHIR
@@ -102,12 +116,13 @@ def push_fhir_to_eka_records(
     document_id and batch_response. Requires real file (PDF) per API spec.
     Set include_metadata=False to test without FHIR metadata (isolate 500).
     """
-    base_url = (base_url or EKA_BASE_URL or EKA_BASE).rstrip("/")
+    eka_headers, base = _eka_headers_and_base(eka_auth)
+    base_url = (base_url or base).rstrip("/")
     pdf_bytes = _minimal_pdf_bytes(title=title or "Scribe to EkaCare")
     file_size = len(pdf_bytes)
 
     url = f"{base_url}/mr/api/v1/docs"
-    headers = {**get_eka_headers(), "Content-Type": "application/json", "X-Pt-Id": x_pt_id}
+    headers = {**eka_headers, "Content-Type": "application/json", "X-Pt-Id": x_pt_id}
     batch_request = {
         "dt": document_type,
         "dd_e": int(time.time()),
@@ -174,19 +189,23 @@ def create_eka_test_patient(
     dob: str = "1990-01-01",
     gender: str = "M",
     client_id: str | None = None,
-    base_url: str = EKA_BASE,
+    base_url: str | None = None,
+    eka_auth: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Create a test patient in Eka Care. Returns the created patient with 'oid'.
-    Use that oid as X-Pt-Id for Records API. Requires Eka auth (EKA_API_TOKEN or Connect).
+    Use that oid as X-Pt-Id for Records API. Requires Eka auth (api_token or client_id+client_secret).
     """
-    from config import EKA_CLIENT_ID, get_eka_headers
+    from config import EKAEMR_CLIENT_ID
 
-    url = f"{base_url.rstrip('/')}/profiles/v1/patient/"
+    eka_headers, base = _eka_headers_and_base(eka_auth)
+    base_url = (base_url or base).rstrip("/")
+    url = f"{base_url}/profiles/v1/patient/"
+    eka_client_id = (eka_auth or {}).get("client_id") or EKAEMR_CLIENT_ID or "doc"
     headers = {
-        **get_eka_headers(),
+        **eka_headers,
         "Content-Type": "application/json",
-        "client-id": client_id or EKA_CLIENT_ID or "doc",
+        "client-id": client_id or eka_client_id,
     }
     body = {"fln": full_name[:256], "dob": dob, "gen": gender}
     with httpx.Client() as client:

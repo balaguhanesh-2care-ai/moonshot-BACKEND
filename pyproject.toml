@@ -1,0 +1,28 @@
+[project]
+name = "moonshot-backend"
+version = "0.1.0"
+description = "Moonshot backend: Scribe → FHIR → EMR pipeline + LangGraph agent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "requests",
+    "python-multipart",
+    "python-dotenv",
+    "supabase",
+    "reportlab",
+    "langgraph>=0.2.0",
+    "langchain-core>=0.3.0",
+    "langchain-groq>=0.2.0",
+    "scribe2fhir",
+]
+
+[tool.uv.sources]
+scribe2fhir = { path = "scribe2fhir/python", editable = true }
+
+[project.optional-dependencies]
+dev = []
+
+[tool.uv]

@@ -5,28 +5,31 @@ from typing import Any
 
 import httpx
 
-from config import get_eka_headers
+from config import EKASCRIBE_BASE_URL, get_eka_scribe_headers, get_eka_scribe_headers_from_params
 
 log = logging.getLogger(__name__)
 
-EKA_BASE = "https://api.eka.care"
-FILE_UPLOAD_URL = f"{EKA_BASE}/v1/file-upload"
-INIT_URL_TEMPLATE = f"{EKA_BASE}/voice/api/v2/transaction/init/{{txn_id}}"
-STATUS_URL_TEMPLATE = f"{EKA_BASE}/voice/api/v3/status/{{txn_id}}"
-
+EKASCRIBE_BASE = "https://api.eka.care"
 POLL_INTERVAL_SEC = 3
 MAX_POLL_ATTEMPTS = 120
 
 
-async def get_presigned_url(txn_id: str) -> dict[str, Any]:
+def _scribe_headers_and_base(eka_auth: dict[str, Any] | None) -> tuple[dict[str, str], str]:
+    if eka_auth and (eka_auth.get("api_token") or (eka_auth.get("client_id") and eka_auth.get("client_secret"))):
+        return get_eka_scribe_headers_from_params(
+            api_token=eka_auth.get("api_token"),
+            client_id=eka_auth.get("client_id"),
+            client_secret=eka_auth.get("client_secret"),
+            base_url=eka_auth.get("base_url"),
+        )
+    return get_eka_scribe_headers(), (EKASCRIBE_BASE_URL or EKASCRIBE_BASE).rstrip("/")
+
+
+async def get_presigned_url(txn_id: str, headers: dict[str, str], base_url: str) -> dict[str, Any]:
+    url = f"{base_url.rstrip('/')}/v1/file-upload"
     params = {"action": "ekascribe-v2", "txn_id": txn_id}
     async with httpx.AsyncClient() as client:
-        r = await client.post(
-            FILE_UPLOAD_URL,
-            params=params,
-            headers=get_eka_headers(),
-            timeout=30.0,
-        )
+        r = await client.post(url, params=params, headers=headers, timeout=30.0)
         r.raise_for_status()
         return r.json()
 
@@ -82,6 +85,8 @@ async def init_transaction(
     txn_id: str,
     batch_s3_url: str,
     client_generated_files: list[str],
+    headers: dict[str, str],
+    base_url: str,
     *,
     mode: str = "dictation",
     transfer: str = "non-vaded",
@@ -100,26 +105,22 @@ async def init_transaction(
             {"template_id": "eka_emr_template", "codification_needed": False}
         ],
     }
-    url = INIT_URL_TEMPLATE.format(txn_id=txn_id)
+    url = f"{base_url.rstrip('/')}/voice/api/v2/transaction/init/{txn_id}"
     async with httpx.AsyncClient() as client:
         r = await client.post(
             url,
             json=body,
-            headers={**get_eka_headers(), "Content-Type": "application/json"},
+            headers={**headers, "Content-Type": "application/json"},
             timeout=30.0,
         )
         r.raise_for_status()
         return r.json()
 
 
-async def get_status(txn_id: str) -> tuple[int, dict[str, Any]]:
-    url = STATUS_URL_TEMPLATE.format(txn_id=txn_id)
+async def get_status(txn_id: str, headers: dict[str, str], base_url: str) -> tuple[int, dict[str, Any]]:
+    url = f"{base_url.rstrip('/')}/voice/api/v3/status/{txn_id}"
     async with httpx.AsyncClient() as client:
-        r = await client.get(
-            url,
-            headers=get_eka_headers(),
-            timeout=30.0,
-        )
+        r = await client.get(url, headers=headers, timeout=30.0)
         return r.status_code, r.json() if r.content else {}
 
 
@@ -139,22 +140,15 @@ def _raise_eka_error(response: httpx.Response, context: str = "") -> None:
 
 async def transcribe_audio_files(
     files: list[tuple[str, bytes]],
+    *,
+    eka_auth: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not files:
         raise ValueError("At least one file required")
+    headers, base_url = _scribe_headers_and_base(eka_auth)
     txn_id = f"txn_{uuid.uuid4().hex[:12]}"
     log.info("EkaScribe txn_id=%s files=%s", txn_id, [n for n, _ in files])
-    headers = get_eka_headers()
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            FILE_UPLOAD_URL,
-            params={"action": "ekascribe-v2", "txn_id": txn_id},
-            headers=headers,
-            timeout=30.0,
-        )
-        if not r.is_success:
-            _raise_eka_error(r, "file-upload presigned URL")
-        presigned = r.json()
+    presigned = await get_presigned_url(txn_id, headers, base_url)
     upload_data = presigned["uploadData"]
     folder_path = presigned["folderPath"]
     filenames = []
@@ -163,10 +157,10 @@ async def transcribe_audio_files(
         filenames.append(filename)
     log.info("EkaScribe upload done: %s", filenames)
     batch_s3_url = upload_data["url"].rstrip("/") + "/" + folder_path
-    await init_transaction(txn_id, batch_s3_url, filenames)
+    await init_transaction(txn_id, batch_s3_url, filenames, headers, base_url)
     log.info("EkaScribe init done, polling status...")
     for attempt in range(MAX_POLL_ATTEMPTS):
-        status_code, data = await get_status(txn_id)
+        status_code, data = await get_status(txn_id, headers, base_url)
         if status_code == 200:
             log.info("EkaScribe completed (200) after %d poll(s). Keys: %s", attempt + 1, list(data.keys()) if isinstance(data, dict) else "n/a")
             return data
