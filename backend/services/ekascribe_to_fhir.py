@@ -106,6 +106,7 @@ def _normalize_identifiers(v: Any) -> list[tuple[str, str]] | None:
 
 
 def _eka_severity_from_properties(properties: dict[str, Any]) -> Severity | None:
+    from scribe2fhir.core import Severity as _Severity
     if not isinstance(properties, dict):
         return None
     for v in properties.values():
@@ -114,7 +115,7 @@ def _eka_severity_from_properties(properties: dict[str, Any]) -> Severity | None
             if isinstance(sel, list) and sel and isinstance(sel[0], dict):
                 val = _safe_str(sel[0].get("value"))
                 if val and val.lower() in ("mild", "moderate", "severe"):
-                    return Severity(val.lower())
+                    return _Severity(val.lower())
     return None
 
 

@@ -138,7 +138,10 @@ async def audio_to_fhir(
                     detail = e.response.text[:500]
         raise HTTPException(status_code=502, detail=f"EkaScribe error: {detail}")
 
-    ekascribe_keys = list(ekascribe_result.keys()) if isinstance(ekascribe_result, dict) else []
+    if not isinstance(ekascribe_result, dict):
+        log.error("EkaScribe returned non-dict: %s", type(ekascribe_result).__name__)
+        raise HTTPException(status_code=502, detail="EkaScribe returned invalid response shape")
+    ekascribe_keys = list(ekascribe_result.keys())
     log.info("EkaScribe done. Response top-level keys: %s", ekascribe_keys)
 
     try:
@@ -148,7 +151,10 @@ async def audio_to_fhir(
         log.exception("scribe2fhir mapping failed")
         raise HTTPException(status_code=502, detail=f"scribe2fhir mapping error: {e}")
 
-    entry_count = len(fhir_bundle.get("entry") or []) if isinstance(fhir_bundle, dict) else 0
+    if not isinstance(fhir_bundle, dict) or fhir_bundle.get("resourceType") != "Bundle":
+        log.error("FHIR bundle invalid: resourceType=%s", fhir_bundle.get("resourceType") if isinstance(fhir_bundle, dict) else type(fhir_bundle).__name__)
+        raise HTTPException(status_code=502, detail="scribe2fhir produced invalid FHIR Bundle")
+    entry_count = len(fhir_bundle.get("entry") or [])
     log.info("FHIR bundle built: %d entries", entry_count)
 
     patient_id = None
@@ -313,11 +319,19 @@ async def audio_to_emr(
                     detail = e.response.text[:500]
         raise HTTPException(status_code=502, detail=f"EkaScribe error: {detail}")
 
+    if not isinstance(ekascribe_result, dict):
+        log.error("EkaScribe returned non-dict: %s", type(ekascribe_result).__name__)
+        raise HTTPException(status_code=502, detail="EkaScribe returned invalid response shape")
+
     try:
         fhir_bundle = emr_json_to_fhir_bundle(ekascribe_result)
     except Exception as e:
         log.exception("scribe2fhir mapping failed")
         raise HTTPException(status_code=502, detail=f"scribe2fhir mapping error: {e}")
+
+    if not isinstance(fhir_bundle, dict) or fhir_bundle.get("resourceType") != "Bundle":
+        log.error("FHIR bundle invalid: resourceType=%s", fhir_bundle.get("resourceType") if isinstance(fhir_bundle, dict) else type(fhir_bundle).__name__)
+        raise HTTPException(status_code=502, detail="scribe2fhir produced invalid FHIR Bundle")
 
     patient_id = None
     encounter_id = None
