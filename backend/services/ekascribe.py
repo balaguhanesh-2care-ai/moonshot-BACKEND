@@ -9,6 +9,14 @@ from config import EKASCRIBE_BASE_URL, get_eka_scribe_headers, get_eka_scribe_he
 
 log = logging.getLogger(__name__)
 
+
+class EkaScribeError(Exception):
+    def __init__(self, message: str, status_code: int | None = None, raw: dict | None = None):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+        self.raw = raw
+
 EKASCRIBE_BASE = "https://api.eka.care"
 POLL_INTERVAL_SEC = 3
 MAX_POLL_ATTEMPTS = 120
@@ -169,7 +177,21 @@ async def transcribe_audio_files(
             return data
         if status_code != 202:
             log.error("EkaScribe status %s: %s", status_code, data)
-            raise RuntimeError(f"EkaScribe status {status_code}: {data}")
+            msg = "Transcription failed"
+            if isinstance(data, dict):
+                err = data.get("error")
+                if isinstance(err, dict):
+                    disp = err.get("display_message") or err.get("message")
+                    if isinstance(disp, dict):
+                        inner = disp.get("error")
+                        if isinstance(inner, dict) and inner.get("msg"):
+                            msg = str(inner["msg"])
+                    elif isinstance(disp, str):
+                        msg = disp
+                    code = err.get("code")
+                    if code and str(code) not in msg:
+                        msg = f"{msg} ({code})"
+            raise EkaScribeError(msg, status_code=status_code, raw=data)
         if attempt % 10 == 0 and attempt:
             log.info("EkaScribe still processing (202), poll #%d", attempt + 1)
         await asyncio.sleep(POLL_INTERVAL_SEC)

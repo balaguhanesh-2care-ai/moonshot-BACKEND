@@ -6,7 +6,7 @@ import httpx
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from config import AUDIO_FILE_PATH, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
-from services.ekascribe import transcribe_audio_files
+from services.ekascribe import EkaScribeError, transcribe_audio_files
 from services.ekascribe_to_fhir import get_decoded_prescription
 from services.scribe2fhir import emr_json_to_fhir_bundle, is_available as scribe2fhir_available
 from services.supabase_client import insert_fhir_bundle
@@ -21,6 +21,32 @@ def _ensure_supabase() -> None:
             status_code=503,
             detail="Supabase not configured (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY or NEXT_PUBLIC_* equivalents)",
         )
+
+
+FALLBACK_BUNDLE: dict = {
+    "resourceType": "Bundle",
+    "type": "document",
+    "entry": [],
+}
+
+
+def _pipeline_response(
+    *,
+    ok: bool,
+    bundle: dict | None,
+    db: dict | None,
+    errors: list[dict],
+    scribe: dict | None = None,
+) -> dict:
+    out: dict = {
+        "ok": ok,
+        "bundle": bundle or FALLBACK_BUNDLE,
+        "db": db,
+        "errors": errors,
+    }
+    if scribe is not None:
+        out["scribe"] = scribe
+    return out
 
 
 async def _get_audio_tuples(request: Request) -> list[tuple[str, bytes]]:
@@ -119,6 +145,12 @@ async def audio_to_fhir(
             status_code=400,
             detail="Missing Scribe credentials: send X-EkaScribe-Api-Token or X-EkaScribe-Client-Id + X-EkaScribe-Client-Secret",
         )
+
+    errors: list[dict] = []
+    ekascribe_result: dict | None = None
+    fhir_bundle: dict | None = None
+    row: dict | None = None
+
     try:
         log.info("Calling EkaScribe (upload + init + poll)...")
         ekascribe_result = await transcribe_audio_files(file_tuples, eka_auth=eka_auth)
@@ -126,6 +158,9 @@ async def audio_to_fhir(
         raise HTTPException(status_code=400, detail=str(e))
     except TimeoutError as e:
         raise HTTPException(status_code=504, detail=str(e))
+    except EkaScribeError as e:
+        log.warning("EkaScribe failed: %s", e.message)
+        errors.append({"step": "ekascribe", "message": e.message})
     except Exception as e:
         log.exception("EkaScribe failed")
         detail = str(e)
@@ -136,41 +171,44 @@ async def audio_to_fhir(
             except Exception:
                 if e.response.text:
                     detail = e.response.text[:500]
-        raise HTTPException(status_code=502, detail=f"EkaScribe error: {detail}")
+        errors.append({"step": "ekascribe", "message": detail})
+
+    if errors:
+        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors, scribe=ekascribe_result)
 
     if not isinstance(ekascribe_result, dict):
         log.error("EkaScribe returned non-dict: %s", type(ekascribe_result).__name__)
-        raise HTTPException(status_code=502, detail="EkaScribe returned invalid response shape")
-    ekascribe_keys = list(ekascribe_result.keys())
-    log.info("EkaScribe done. Response top-level keys: %s", ekascribe_keys)
+        errors.append({"step": "ekascribe", "message": "Invalid response shape"})
+        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors, scribe=ekascribe_result)
+    log.info("EkaScribe done. Response top-level keys: %s", list(ekascribe_result.keys()))
 
     try:
         log.info("Converting EkaScribe JSON to FHIR bundle...")
         fhir_bundle = emr_json_to_fhir_bundle(ekascribe_result)
     except Exception as e:
         log.exception("scribe2fhir mapping failed")
-        raise HTTPException(status_code=502, detail=f"scribe2fhir mapping error: {e}")
+        errors.append({"step": "fhir", "message": str(e)})
+        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors, scribe=ekascribe_result)
 
     if not isinstance(fhir_bundle, dict) or fhir_bundle.get("resourceType") != "Bundle":
-        log.error("FHIR bundle invalid: resourceType=%s", fhir_bundle.get("resourceType") if isinstance(fhir_bundle, dict) else type(fhir_bundle).__name__)
-        raise HTTPException(status_code=502, detail="scribe2fhir produced invalid FHIR Bundle")
-    entry_count = len(fhir_bundle.get("entry") or [])
-    log.info("FHIR bundle built: %d entries", entry_count)
+        log.error("FHIR bundle invalid")
+        errors.append({"step": "fhir", "message": "Invalid FHIR Bundle"})
+        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors, scribe=ekascribe_result)
+    log.info("FHIR bundle built: %d entries", len(fhir_bundle.get("entry") or []))
 
     patient_id = None
     encounter_id = None
     txn_id = ekascribe_result.get("txn_id") or ekascribe_result.get("transaction_id") or ekascribe_result.get("id")
-    if isinstance(fhir_bundle, dict):
-        for entry in (fhir_bundle.get("entry") or []):
-            res = entry.get("resource") if isinstance(entry, dict) else None
-            if isinstance(res, dict):
-                rt = res.get("resourceType")
-                if rt == "Patient" and res.get("id"):
-                    patient_id = res.get("id")
-                if rt == "Encounter" and res.get("id"):
-                    encounter_id = res.get("id")
-                if patient_id and encounter_id:
-                    break
+    for entry in (fhir_bundle.get("entry") or []):
+        res = entry.get("resource") if isinstance(entry, dict) else None
+        if isinstance(res, dict):
+            rt = res.get("resourceType")
+            if rt == "Patient" and res.get("id"):
+                patient_id = res.get("id")
+            if rt == "Encounter" and res.get("id"):
+                encounter_id = res.get("id")
+            if patient_id and encounter_id:
+                break
 
     decoded_prescription = get_decoded_prescription(ekascribe_result)
     try:
@@ -185,15 +223,17 @@ async def audio_to_fhir(
         )
     except Exception as e:
         log.exception("Supabase insert failed")
-        raise HTTPException(status_code=503, detail=f"Database error: {e}")
+        errors.append({"step": "db", "message": str(e)})
+        return _pipeline_response(ok=False, bundle=fhir_bundle, db=None, errors=errors, scribe=ekascribe_result)
 
-    row_id = row.get("id")
-    log.info("Pipeline done. DB row id=%s patient_id=%s encounter_id=%s", row_id, patient_id, encounter_id)
-
-    return {
-        "bundle": fhir_bundle,
-        "db": {"id": row_id, "created_at": row.get("created_at")},
-    }
+    log.info("Pipeline done. DB row id=%s patient_id=%s encounter_id=%s", row.get("id"), patient_id, encounter_id)
+    return _pipeline_response(
+        ok=True,
+        bundle=fhir_bundle,
+        db={"id": row.get("id"), "created_at": row.get("created_at")},
+        errors=[],
+        scribe=ekascribe_result,
+    )
 
 
 def _auth_from_params(
@@ -300,13 +340,21 @@ async def audio_to_emr(
             status_code=400,
             detail="Missing EMR credentials: send X-EkaEmr-Api-Token or X-Eka-Client-Id + X-Eka-Client-Secret",
         )
+    errors_emr: list[dict] = []
+    ekascribe_result_emr: dict | None = None
+    fhir_bundle_emr: dict | None = None
+    row_emr: dict | None = None
+
     try:
         log.info("Calling EkaScribe (upload + init + poll)...")
-        ekascribe_result = await transcribe_audio_files(file_tuples, eka_auth=eka_scribe_auth)
+        ekascribe_result_emr = await transcribe_audio_files(file_tuples, eka_auth=eka_scribe_auth)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except TimeoutError as e:
         raise HTTPException(status_code=504, detail=str(e))
+    except EkaScribeError as e:
+        log.warning("EkaScribe failed: %s", e.message)
+        errors_emr.append({"step": "ekascribe", "message": e.message})
     except Exception as e:
         log.exception("EkaScribe failed")
         detail = str(e)
@@ -317,26 +365,32 @@ async def audio_to_emr(
             except Exception:
                 if e.response.text:
                     detail = e.response.text[:500]
-        raise HTTPException(status_code=502, detail=f"EkaScribe error: {detail}")
+        errors_emr.append({"step": "ekascribe", "message": detail})
 
-    if not isinstance(ekascribe_result, dict):
-        log.error("EkaScribe returned non-dict: %s", type(ekascribe_result).__name__)
-        raise HTTPException(status_code=502, detail="EkaScribe returned invalid response shape")
+    if errors_emr:
+        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors_emr, scribe=ekascribe_result_emr)
+
+    if not isinstance(ekascribe_result_emr, dict):
+        log.error("EkaScribe returned non-dict: %s", type(ekascribe_result_emr).__name__)
+        errors_emr.append({"step": "ekascribe", "message": "Invalid response shape"})
+        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors_emr, scribe=ekascribe_result_emr)
 
     try:
-        fhir_bundle = emr_json_to_fhir_bundle(ekascribe_result)
+        fhir_bundle_emr = emr_json_to_fhir_bundle(ekascribe_result_emr)
     except Exception as e:
         log.exception("scribe2fhir mapping failed")
-        raise HTTPException(status_code=502, detail=f"scribe2fhir mapping error: {e}")
+        errors_emr.append({"step": "fhir", "message": str(e)})
+        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors_emr, scribe=ekascribe_result_emr)
 
-    if not isinstance(fhir_bundle, dict) or fhir_bundle.get("resourceType") != "Bundle":
-        log.error("FHIR bundle invalid: resourceType=%s", fhir_bundle.get("resourceType") if isinstance(fhir_bundle, dict) else type(fhir_bundle).__name__)
-        raise HTTPException(status_code=502, detail="scribe2fhir produced invalid FHIR Bundle")
+    if not isinstance(fhir_bundle_emr, dict) or fhir_bundle_emr.get("resourceType") != "Bundle":
+        log.error("FHIR bundle invalid")
+        errors_emr.append({"step": "fhir", "message": "Invalid FHIR Bundle"})
+        return _pipeline_response(ok=False, bundle=None, db=None, errors=errors_emr, scribe=ekascribe_result_emr)
 
     patient_id = None
     encounter_id = None
-    txn_id = ekascribe_result.get("txn_id") or ekascribe_result.get("transaction_id") or ekascribe_result.get("id")
-    for entry in (fhir_bundle.get("entry") or []):
+    txn_id = ekascribe_result_emr.get("txn_id") or ekascribe_result_emr.get("transaction_id") or ekascribe_result_emr.get("id")
+    for entry in (fhir_bundle_emr.get("entry") or []):
         res = entry.get("resource") if isinstance(entry, dict) else None
         if isinstance(res, dict):
             rt = res.get("resourceType")
@@ -347,11 +401,11 @@ async def audio_to_emr(
             if patient_id and encounter_id:
                 break
 
-    decoded_prescription = get_decoded_prescription(ekascribe_result)
+    decoded_prescription = get_decoded_prescription(ekascribe_result_emr)
     try:
-        row = insert_fhir_bundle(
-            fhir_bundle,
-            ekascribe_json=ekascribe_result,
+        row_emr = insert_fhir_bundle(
+            fhir_bundle_emr,
+            ekascribe_json=ekascribe_result_emr,
             decoded_prescription=decoded_prescription,
             patient_id=patient_id,
             encounter_id=encounter_id,
@@ -359,13 +413,14 @@ async def audio_to_emr(
         )
     except Exception as e:
         log.exception("Supabase insert failed")
-        raise HTTPException(status_code=503, detail=f"Database error: {e}")
+        errors_emr.append({"step": "db", "message": str(e)})
+        return _pipeline_response(ok=False, bundle=fhir_bundle_emr, db=None, errors=errors_emr, scribe=ekascribe_result_emr)
 
-    row_id = row.get("id")
     log.info("Pipeline done. FHIR stored in Supabase (EkaCare docs push disabled).")
-
-    return {
-        "scribe": ekascribe_result,
-        "bundle": fhir_bundle,
-        "db": {"id": row_id, "created_at": row.get("created_at")},
-    }
+    return _pipeline_response(
+        ok=True,
+        bundle=fhir_bundle_emr,
+        db={"id": row_emr.get("id"), "created_at": row_emr.get("created_at")},
+        errors=[],
+        scribe=ekascribe_result_emr,
+    )
