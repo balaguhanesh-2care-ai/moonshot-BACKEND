@@ -353,30 +353,6 @@ wheels = [
 ]
 
 [[package]]
-name = "fhir-core"
-version = "1.1.5"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "pydantic" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/dd/89/22e3b5eecb847812571089ad1c406e5d966fc819d71d119f0f5618bb8d3b/fhir_core-1.1.5.tar.gz", hash = "sha256:fc3c14252d32bf0502fdbcec7136685308cc81bf76ae754c3be3aac66bfa5801", size = 34417, upload-time = "2026-01-29T10:47:13.459Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/bf/b4/988e247cbb18d61f676b563b7af77e49e971b4fb2147d9024baf36581c1e/fhir_core-1.1.5-py2.py3-none-any.whl", hash = "sha256:8b6a51487ab002410fdc77f5dac8e83e20929693483837c3c237af11ca3e5896", size = 29614, upload-time = "2026-01-29T10:47:11.906Z" },
-]
-
-[[package]]
-name = "fhir-resources"
-version = "8.1.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "fhir-core" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/d4/7f/882dde9ce229fccfa81257c6989edb4b0d67f7e8ae94170e74be024fdfa9/fhir_resources-8.1.0.tar.gz", hash = "sha256:8d64a717f37ea50bde97c1b8ff3fd969a6074df99c167183a273abe4da8bbfa5", size = 1599741, upload-time = "2025-07-10T12:36:01.137Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/cc/a9/18672a8a1c570cb7b4eeafe1decd267f291997d20f240fffb17145a525f9/fhir_resources-8.1.0-py2.py3-none-any.whl", hash = "sha256:4370a5b6b35f278705328368bf79b3a17db91025fd4ec896fb963edd44ecc5de", size = 2267435, upload-time = "2025-07-10T12:35:59.096Z" },
-]
-
-[[package]]
 name = "fsspec"
 version = "2026.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -802,7 +778,6 @@ dependencies = [
     { name = "python-multipart" },
     { name = "reportlab" },
     { name = "requests" },
-    { name = "scribe2fhir" },
     { name = "supabase" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -818,7 +793,6 @@ requires-dist = [
     { name = "python-multipart" },
     { name = "reportlab" },
     { name = "requests" },
-    { name = "scribe2fhir", editable = "scribe2fhir/python" },
     { name = "supabase" },
     { name = "uvicorn", extras = ["standard"] },
 ]
@@ -1771,31 +1745,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/a1/84/4831f881aa6ff3c97
 wheels = [
     { url = "https://files.pythonhosted.org/packages/87/2a/a1810c8627b9ec8c57ec5ec325d306701ae7be50235e8fd81266e002a3cc/rich-14.3.1-py3-none-any.whl", hash = "sha256:da750b1aebbff0b372557426fb3f35ba56de8ef954b3190315eb64076d6fb54e", size = 309952, upload-time = "2026-01-24T21:40:42.969Z" },
 ]
-
-[[package]]
-name = "scribe2fhir"
-version = "0.1.0"
-source = { editable = "scribe2fhir/python" }
-dependencies = [
-    { name = "fhir-resources" },
-    { name = "pydantic" },
-    { name = "typing-extensions" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "black", marker = "extra == 'dev'", specifier = ">=22.0.0" },
-    { name = "fhir-resources", specifier = ">=7.0.0" },
-    { name = "isort", marker = "extra == 'dev'", specifier = ">=5.0.0" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
-    { name = "pydantic", specifier = ">=2.0.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0.0" },
-    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
-    { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=4.0.0" },
-    { name = "typing-extensions", specifier = ">=4.0.0" },
-]
-provides-extras = ["dev", "test"]
 
 [[package]]
 name = "six"

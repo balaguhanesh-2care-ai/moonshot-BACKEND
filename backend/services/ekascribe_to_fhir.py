@@ -4,15 +4,6 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from scribe2fhir.core import (
-    FHIRDocumentBuilder,
-    Severity,
-    FindingStatus,
-    ConditionClinicalStatus,
-    Interpretation,
-    AllergyCategory,
-)
-
 log = logging.getLogger(__name__)
 
 
@@ -146,6 +137,14 @@ def _eka_vital_value(item: dict[str, Any]) -> tuple[Any, str | None]:
 
 
 def ekascribe_result_to_fhir_bundle(ekascribe_result: dict[str, Any]) -> dict[str, Any]:
+    from scribe2fhir.core import (
+        FHIRDocumentBuilder,
+        Severity,
+        FindingStatus,
+        ConditionClinicalStatus,
+        Interpretation,
+        AllergyCategory,
+    )
     payload = _extract_payload(ekascribe_result)
     try:
         log.info("Eka EMR raw JSON (decoded prescription): %s", json.dumps(payload, indent=2, default=str))
